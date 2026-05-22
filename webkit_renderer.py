@@ -85,6 +85,7 @@ class _WebKitRenderer:
     def __init__(self) -> None:
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
+        self._stop = threading.Event()
         self._webview = None
         self._app = None
         self._delegate_class = None
@@ -95,6 +96,9 @@ class _WebKitRenderer:
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="webkit-runloop")
         self._thread.start()
         self._ready.wait(timeout=5.0)
+
+    def stop(self) -> None:
+        self._stop.set()
 
     def load_url(self, url: str, callback, timeout: float = 10.0) -> None:
         # The runloop polls self._pending every 50ms and picks this up automatically.
@@ -141,6 +145,9 @@ class _WebKitRenderer:
             # Run the loop indefinitely, processing pending loads
             runloop = AppKit.NSRunLoop.currentRunLoop()
             while True:
+                if self._stop.is_set():
+                    break
+
                 with self._lock:
                     pending = self._pending
                     self._pending = None
@@ -149,7 +156,7 @@ class _WebKitRenderer:
                     url_str, callback, timeout = pending
                     self._do_load(url_str, callback, timeout)
 
-                # Run loop for 0.1s to process WebKit callbacks
+                # Run loop for 50ms to process WebKit callbacks
                 runloop.runUntilDate_(
                     AppKit.NSDate.dateWithTimeIntervalSinceNow_(0.05)
                 )

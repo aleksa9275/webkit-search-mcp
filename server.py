@@ -16,6 +16,7 @@ from typing import Any, Literal
 import mcp.server.stdio
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
+from mcp.server import NotificationOptions
 from mcp.types import TextContent, Tool
 
 import fetch as _fetch
@@ -317,7 +318,7 @@ async def main() -> None:
                 server_name="webkit-search-mcp",
                 server_version="0.1.0",
                 capabilities=app.get_capabilities(
-                    notification_options=None,
+                    notification_options=NotificationOptions(),
                     experimental_capabilities={},
                 ),
             ),
@@ -325,4 +326,11 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        import webkit_renderer
+        if webkit_renderer._renderer is not None:
+            webkit_renderer._renderer.stop()
