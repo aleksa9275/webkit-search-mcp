@@ -45,7 +45,7 @@ Add to your oMLX `mcp_servers` configuration (typically in `~/Library/Applicatio
 {
   "mcp_servers": {
     "webkit-search": {
-      "command": "/path/to/webkit-search-mcp/.venv/bin/python",
+      "command": "/path/to/webkit-search-mcp/.webkit-mcp/bin/python",
       "args": ["/path/to/webkit-search-mcp/server.py"],
       "transport": "stdio"
     }
@@ -63,7 +63,7 @@ Add to `~/.config/opencode/config.json` (or your project's `.opencode/config.jso
     "servers": {
       "webkit-search": {
         "type": "stdio",
-        "command": "/path/to/webkit-search-mcp/.venv/bin/python",
+        "command": "/path/to/webkit-search-mcp/.webkit-mcp/bin/python",
         "args": ["/path/to/webkit-search-mcp/server.py"]
       }
     }
@@ -79,7 +79,7 @@ In LM Studio → Settings → MCP Servers, add a new server entry:
 {
   "name": "webkit-search",
   "transport": "stdio",
-  "command": "/path/to/webkit-search-mcp/.venv/bin/python",
+  "command": "/path/to/webkit-search-mcp/.webkit-mcp/bin/python",
   "args": ["/path/to/webkit-search-mcp/server.py"]
 }
 ```
@@ -92,7 +92,7 @@ Or edit `~/Library/Application Support/LM Studio/mcp-servers.json` directly:
     {
       "name": "webkit-search",
       "transport": "stdio",
-      "command": "/path/to/webkit-search-mcp/.venv/bin/python",
+      "command": "/path/to/webkit-search-mcp/.webkit-mcp/bin/python",
       "args": ["/path/to/webkit-search-mcp/server.py"]
     }
   ]
