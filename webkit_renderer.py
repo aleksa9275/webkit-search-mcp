@@ -1,24 +1,48 @@
 from __future__ import annotations
 
 """
-Headless WebKit renderer using PyObjC.
+Headless WebKit renderer using PyObjC, via subprocess isolation.
 
-Runs WKWebView in a dedicated background thread with its own NSRunLoop.
-Never call WebKit APIs from asyncio's event loop thread — deadlock.
-Bridge back to asyncio via concurrent.futures.Future.
+WebKit (WKWebView) is strictly main-thread-only — it aborts with a fatal
+assertion if initialized or driven from any other thread. The MCP server's
+main thread is occupied by the asyncio stdio loop, so WebKit cannot run there.
+
+Instead, each render runs in a short-lived helper SUBPROCESS whose own main
+thread drives the Cocoa/WebKit run loop. The async parent spawns it, reads the
+rendered HTML from stdout, and enforces a timeout by killing the child.
+
+Benefits beyond correctness:
+  * Crash isolation — a hostile page that crashes WebKit kills the child, not
+    the server.
+  * Privacy isolation — every render is a fresh process with an ephemeral
+    (non-persistent) data store; nothing leaks between requests.
+  * No asyncio/Cocoa run-loop interleaving, so no deadlocks.
+
+Run as a script ("python webkit_renderer.py render <url> <timeout>") it performs
+a single render on its main thread and writes the page HTML to stdout.
 """
 
 import asyncio
+import json
 import logging
-import threading
-import time
+import sys
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _WEBKIT_AVAILABLE = False
-_renderer: Optional["_WebKitRenderer"] = None
-_renderer_lock = threading.Lock()
+
+# Bound concurrent WebKit subprocesses — each is a full browser engine; a
+# looping agent firing many deep_search calls could otherwise fork-bomb the host.
+_MAX_CONCURRENT_RENDERS = 2
+_render_sem: Optional["asyncio.Semaphore"] = None
+
+
+def _get_render_sem() -> "asyncio.Semaphore":
+    global _render_sem
+    if _render_sem is None:
+        _render_sem = asyncio.Semaphore(_MAX_CONCURRENT_RENDERS)
+    return _render_sem
 
 
 def is_available() -> bool:
@@ -41,205 +65,263 @@ def _try_import() -> bool:
 _try_import()
 
 
-def get_renderer() -> Optional["_WebKitRenderer"]:
-    global _renderer
-    if not _WEBKIT_AVAILABLE:
-        return None
-    with _renderer_lock:
-        if _renderer is None:
-            _renderer = _WebKitRenderer()
-            _renderer.start()
-        return _renderer
-
+# ---------------------------------------------------------------------------
+# Async parent: spawn the helper subprocess and read its output
+# ---------------------------------------------------------------------------
 
 async def render_page(url: str, timeout: float = 10.0) -> Optional[str]:
-    """Render a URL with WebKit and return raw HTML. Returns None on failure."""
-    renderer = get_renderer()
-    if renderer is None:
+    """
+    Render a URL with WebKit in an isolated subprocess and return raw HTML.
+    Returns None on failure or timeout.
+    """
+    if not _WEBKIT_AVAILABLE:
         return None
-    loop = asyncio.get_event_loop()
-    future: asyncio.Future[Optional[str]] = loop.create_future()
 
-    def _callback(html: Optional[str], error: Optional[str]) -> None:
-        if not future.done():
-            loop.call_soon_threadsafe(
-                future.set_result, html if html is not None else None
+    async with _get_render_sem():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                __file__,
+                "render",
+                url,
+                str(timeout),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+        except Exception as e:
+            logger.debug("failed to spawn WebKit subprocess: %s", e)
+            return None
 
-    renderer.load_url(url, _callback, timeout=timeout)
+        try:
+            # The child self-limits via an in-loop timer; this is a hard backstop.
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout + 5.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("WebKit subprocess timed out for %s — killing", url)
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return None
+
+    if proc.returncode != 0:
+        msg = stderr.decode("utf-8", errors="replace").strip()
+        logger.debug("WebKit subprocess exit %s for %s: %s", proc.returncode, url, msg[:200])
+        return None
+
+    html = stdout.decode("utf-8", errors="replace")
+    return html or None
+
+
+# ---------------------------------------------------------------------------
+# Child process: render a single URL on the main thread
+# ---------------------------------------------------------------------------
+
+def _render_main(url: str, timeout: float) -> int:
+    """
+    Render `url` on this process's main thread and write HTML to stdout.
+    Returns a process exit code (0 = success, even for partial content).
+    """
+    from safety import check_url_sync, is_url_safe_sync
+
+    # SSRF guard inside the child too (defense in depth).
+    reason = check_url_sync(url)
+    if reason:
+        sys.stderr.write(f"blocked: {reason}\n")
+        return 2
 
     try:
-        return await asyncio.wait_for(future, timeout=timeout + 2)
-    except asyncio.TimeoutError:
-        logger.warning("WebKit render timed out for %s", url)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Internal implementation
-# ---------------------------------------------------------------------------
-
-class _WebKitRenderer:
-    """Wraps a WKWebView running on a dedicated thread with its own NSRunLoop."""
-
-    def __init__(self) -> None:
-        self._thread: Optional[threading.Thread] = None
-        self._ready = threading.Event()
-        self._stop = threading.Event()
-        self._webview = None
-        self._app = None
-        self._delegate_class = None
-        self._pending: Optional[tuple] = None  # (url, callback, timeout)
-        self._lock = threading.Lock()
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="webkit-runloop")
-        self._thread.start()
-        self._ready.wait(timeout=5.0)
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def load_url(self, url: str, callback, timeout: float = 10.0) -> None:
-        # The runloop polls self._pending every 50ms and picks this up automatically.
-        with self._lock:
-            self._pending = (url, callback, timeout)
-
-    def _run_loop(self) -> None:
-        """Entry point for the dedicated WebKit thread."""
-        if not _WEBKIT_AVAILABLE:
-            return
-        try:
-            import AppKit
-            import WebKit
-            import objc
-
-            # Initialize a minimal NSApplication (needed for WebKit)
-            app = AppKit.NSApplication.sharedApplication()
-            app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
-
-            # Build delegate class dynamically
-            NavigationDelegate = self._build_delegate_class()
-
-            # WKWebViewConfiguration: ephemeral (no persistent store)
-            config = WebKit.WKWebViewConfiguration.alloc().init()
-            config.setWebsiteDataStore_(
-                WebKit.WKWebsiteDataStore.nonPersistentDataStore()
-            )
-            prefs = WebKit.WKPreferences.alloc().init()
-            prefs.setJavaScriptEnabled_(True)
-            config.setPreferences_(prefs)
-
-            # Off-screen frame (1×1, never shown)
-            frame = AppKit.NSMakeRect(0, 0, 1280, 800)
-            webview = WebKit.WKWebView.alloc().initWithFrame_configuration_(frame, config)
-
-            delegate = NavigationDelegate.alloc().init()
-            delegate._renderer = self  # back-reference
-            webview.setNavigationDelegate_(delegate)
-
-            self._webview = webview
-            self._webview_controller = delegate
-            self._ready.set()
-
-            # Run the loop indefinitely, processing pending loads
-            runloop = AppKit.NSRunLoop.currentRunLoop()
-            while True:
-                if self._stop.is_set():
-                    break
-
-                with self._lock:
-                    pending = self._pending
-                    self._pending = None
-
-                if pending is not None:
-                    url_str, callback, timeout = pending
-                    self._do_load(url_str, callback, timeout)
-
-                # Run loop for 50ms to process WebKit callbacks
-                runloop.runUntilDate_(
-                    AppKit.NSDate.dateWithTimeIntervalSinceNow_(0.05)
-                )
-
-        except Exception as e:
-            logger.error("WebKit thread crashed: %s", e)
-            self._ready.set()
-
-    def _build_delegate_class(self):
-        """Dynamically build an ObjC NavigationDelegate class."""
-        import WebKit
-        import objc
-
-        class NavigationDelegate(
-            objc.lookUpClass("NSObject"),
-            protocols=[objc.protocolNamed("WKNavigationDelegate")],
-        ):
-            _renderer = None
-            _callback = None
-            _timer_start = 0.0
-            _timeout = 10.0
-            _done = False
-
-            def webView_didFinishNavigation_(self, webview, navigation):
-                if self._done:
-                    return
-                self._extract_html(webview)
-
-            def webView_didFailNavigation_withError_(self, webview, navigation, error):
-                if self._done:
-                    return
-                self._done = True
-                if self._callback:
-                    self._callback(None, str(error))
-                    self._callback = None
-
-            def webView_didFailProvisionalNavigation_withError_(self, webview, navigation, error):
-                if self._done:
-                    return
-                self._done = True
-                if self._callback:
-                    self._callback(None, str(error))
-                    self._callback = None
-
-            def _extract_html(self, webview):
-                self._done = True
-                cb = self._callback
-                self._callback = None
-
-                def _js_done(result, error):
-                    if cb:
-                        cb(result, None if error is None else str(error))
-
-                webview.evaluateJavaScript_completionHandler_(
-                    "document.documentElement.outerHTML", _js_done
-                )
-
-
-        return NavigationDelegate
-
-    def _do_load(self, url_str: str, callback, timeout: float) -> None:
-        """Called from the WebKit thread to initiate a page load."""
         import AppKit
         import WebKit
+        import objc
+    except ImportError as e:
+        sys.stderr.write(f"PyObjC unavailable: {e}\n")
+        return 3
 
-        delegate = self._webview.navigationDelegate()
-        delegate._callback = callback
-        delegate._timer_start = time.monotonic()
-        delegate._timeout = timeout
-        delegate._done = False
+    holder: dict[str, Optional[str]] = {"html": None, "done": False}
 
-        nsurl = AppKit.NSURL.URLWithString_(url_str)
-        if nsurl is None:
-            callback(None, "Invalid URL")
+    def _finish(html: Optional[str]) -> None:
+        if holder["done"]:
             return
-        request = AppKit.NSURLRequest.requestWithURL_(nsurl)
-        self._webview.loadRequest_(request)
+        holder["done"] = True
+        holder["html"] = html
+        app = AppKit.NSApplication.sharedApplication()
+        app.stop_(None)
+        # stop_ only takes effect on the next event — post one to wake the loop.
+        event = AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+            AppKit.NSEventTypeApplicationDefined,
+            AppKit.NSMakePoint(0, 0),
+            0, 0, 0, None, 0, 0, 0,
+        )
+        app.postEvent_atStart_(event, True)
 
-        # Timeout watchdog
-        def _watchdog():
-            time.sleep(timeout)
-            if not delegate._done:
-                logger.warning("WebKit timeout for %s — extracting partial", url_str)
-                delegate._extract_html(self._webview)
+    NavigationDelegate = _build_child_delegate(WebKit, objc, AppKit, holder, _finish, is_url_safe_sync)
 
-        threading.Thread(target=_watchdog, daemon=True).start()
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+    config = WebKit.WKWebViewConfiguration.alloc().init()
+    config.setWebsiteDataStore_(WebKit.WKWebsiteDataStore.nonPersistentDataStore())
+    prefs = WebKit.WKPreferences.alloc().init()
+    try:
+        prefs.setJavaScriptEnabled_(True)
+    except Exception:
+        pass
+    config.setPreferences_(prefs)
+
+    frame = AppKit.NSMakeRect(0, 0, 1280, 800)
+    webview = WebKit.WKWebView.alloc().initWithFrame_configuration_(frame, config)
+    delegate = NavigationDelegate.alloc().init()
+    webview.setNavigationDelegate_(delegate)
+
+    nsurl = AppKit.NSURL.URLWithString_(url)
+    if nsurl is None:
+        sys.stderr.write("invalid URL\n")
+        return 4
+    request = AppKit.NSURLRequest.requestWithURL_(nsurl)
+
+    def _start_load():
+        webview.loadRequest_(request)
+        # Timeout fires on the main run loop; grabs partial content if any.
+        delegate.scheduleTimeout_withWebView_(timeout, webview)
+
+    # Block the page's own JS subresource/XHR loads to internal hosts (the main
+    # frame is already validated, but JS fetch() could otherwise reach internal
+    # services). Compile a content rule list, then start the load once it's in
+    # effect. Falls back to loading without the rules if compilation fails.
+    _install_ssrf_rules_then_load(WebKit, webview, _start_load)
+
+    app.run()
+
+    html = holder["html"]
+    if html:
+        sys.stdout.write(html)
+        sys.stdout.flush()
+    return 0
+
+
+# Block loads whose URL host is a private/loopback/link-local literal. WebKit's
+# content-rule regex engine rejects alternation/groups ("Disjunctions are not
+# supported"), so each range is its own rule using only literals + char classes.
+_PRIVATE_URL_FILTERS = [
+    r"^https?://localhost",
+    r"^https?://127\.",
+    r"^https?://0\.0\.0\.0",
+    r"^https?://10\.",
+    r"^https?://169\.254\.",
+    r"^https?://192\.168\.",
+    r"^https?://172\.1[6-9]\.",
+    r"^https?://172\.2[0-9]\.",
+    r"^https?://172\.3[01]\.",
+    r"^https?://\[::1",
+    r"^https?://\[fc",
+    r"^https?://\[fd",
+    r"^https?://\[fe80",
+]
+_SSRF_RULE_JSON = json.dumps(
+    [{"trigger": {"url-filter": f}, "action": {"type": "block"}} for f in _PRIVATE_URL_FILTERS]
+)
+
+
+def _install_ssrf_rules_then_load(WebKit, webview, start_load) -> None:
+    """
+    Compile the SSRF content-rule list and, in its completion handler, attach it
+    to the web view before starting the load. On any failure, load anyway.
+    """
+    try:
+        store = WebKit.WKContentRuleListStore.defaultStore()
+    except Exception:
+        start_load()
+        return
+
+    def _compiled(rule_list, error):
+        try:
+            if rule_list is not None and error is None:
+                ucc = webview.configuration().userContentController()
+                ucc.addContentRuleList_(rule_list)
+            elif error is not None:
+                sys.stderr.write(f"content-rule compile error: {error}\n")
+        except Exception as e:
+            sys.stderr.write(f"content-rule attach error: {e}\n")
+        finally:
+            start_load()
+
+    try:
+        store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler_(
+            "ssrf-block", _SSRF_RULE_JSON, _compiled
+        )
+    except Exception as e:
+        sys.stderr.write(f"content-rule compile call failed: {e}\n")
+        start_load()
+
+
+def _build_child_delegate(WebKit, objc, AppKit, holder, finish, is_url_safe_sync):
+    """Build the WKNavigationDelegate class used inside the child process."""
+
+    class NavigationDelegate(
+        objc.lookUpClass("NSObject"),
+        protocols=[objc.protocolNamed("WKNavigationDelegate")],
+    ):
+        def webView_didReceiveServerRedirectForProvisionalNavigation_(self, webview, navigation):
+            # SSRF guard on HTTP redirects: a public page can 3xx to an internal host.
+            try:
+                url_obj = webview.URL()
+                url_str = str(url_obj.absoluteString()) if url_obj else None
+            except Exception:
+                url_str = None
+            if url_str and not is_url_safe_sync(url_str):
+                sys.stderr.write(f"blocked redirect: {url_str}\n")
+                try:
+                    webview.stopLoading()
+                except Exception:
+                    pass
+                finish(None)
+
+        def webView_didFinishNavigation_(self, webview, navigation):
+            self._extract(webview)
+
+        def webView_didFailNavigation_withError_(self, webview, navigation, error):
+            finish(holder["html"])
+
+        def webView_didFailProvisionalNavigation_withError_(self, webview, navigation, error):
+            finish(holder["html"])
+
+        @objc.python_method
+        def _extract(self, webview):
+            def _js_done(result, error):
+                finish(result if result else holder["html"])
+            webview.evaluateJavaScript_completionHandler_(
+                "document.documentElement.outerHTML", _js_done
+            )
+
+        def scheduleTimeout_withWebView_(self, timeout, webview):
+            self._webview = webview
+            AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                float(timeout), self, b"timeoutFired:", None, False
+            )
+
+        def timeoutFired_(self, timer):
+            if holder["done"]:
+                return
+            # Try to salvage whatever has rendered so far, then stop.
+            try:
+                self._extract(self._webview)
+            except Exception:
+                finish(holder["html"])
+
+    return NavigationDelegate
+
+
+# ---------------------------------------------------------------------------
+# Script entry point (child process)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "render":
+        _url = sys.argv[2]
+        _timeout = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
+        sys.exit(_render_main(_url, _timeout))
+    sys.stderr.write("usage: python webkit_renderer.py render <url> [timeout]\n")
+    sys.exit(64)

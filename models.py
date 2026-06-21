@@ -22,6 +22,7 @@ class FetchedPage(BaseModel):
     content: str
     fetch_method: Literal["httpx", "webkit"]
     error: Optional[str] = None
+    injection_suspected: bool = False
 
 
 class SearchMeta(BaseModel):
@@ -29,6 +30,13 @@ class SearchMeta(BaseModel):
     fetch_method: Literal["httpx", "webkit"]
     elapsed_ms: float
     result_count: int
+    # Safety / anti-injection metadata.
+    # All returned web content is fenced as untrusted data; the boundary token
+    # is content_boundary_nonce. injection_suspected flags heuristic matches.
+    untrusted_content: bool = True
+    content_boundary_nonce: Optional[str] = None
+    injection_suspected: bool = False
+    injection_signals: list[str] = []
 
 
 class WebSearchResponse(BaseModel):

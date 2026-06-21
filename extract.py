@@ -6,6 +6,8 @@ from typing import Optional
 
 import html2text
 
+from safety import sanitize_html, strip_dangerous_unicode
+
 logger = logging.getLogger(__name__)
 
 # Approximate chars per token
@@ -46,6 +48,9 @@ def extract_content(html: str, max_tokens: int = 2000) -> tuple[str, str, int]:
     title = ""
     content_html = ""
 
+    # Strip injection-friendly markup (comments, hidden elements) before extraction
+    html = sanitize_html(html)
+
     # Try readability-lxml
     try:
         from readability import Document
@@ -82,12 +87,14 @@ def extract_content(html: str, max_tokens: int = 2000) -> tuple[str, str, int]:
     # Last resort: strip all tags
     stripped = re.sub(r"<[^>]+>", " ", html)
     stripped = re.sub(r"\s+", " ", stripped).strip()
+    stripped = strip_dangerous_unicode(stripped)
     word_count = len(stripped.split())
     return title, stripped[:max_chars], word_count
 
 
 def _clean_markdown(text: str) -> str:
-    """Remove excessive blank lines and leading/trailing whitespace."""
+    """Remove excessive blank lines, whitespace, and steganographic Unicode."""
+    text = strip_dangerous_unicode(text)
     # Collapse 3+ blank lines to 2
     text = re.sub(r"\n{3,}", "\n\n", text)
     # Remove lines that are just whitespace
